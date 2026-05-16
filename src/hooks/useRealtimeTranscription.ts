@@ -5,18 +5,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { translateWithClaude } from "@/services/claude";
 import { ScribeRealtimeConnection } from "@/services/elevenlabs";
 import { useSessionStore } from "@/stores/sessionStore";
-import type { TranslationSegment } from "@/types";
+import type { AssameseSegment, EnglishTranslation } from "@/types";
 
 const CLAUDE_TIMEOUT_MS = 15_000;
 const SLOW_API_THRESHOLD_MS = 5_000;
-const SLOW_CHUNK_DELAY_MS = 5_000;
 const FAILURES_FOR_WARNING = 3;
 const WARNING_AUTO_DISMISS_MS = 10_000;
-const REPETITION_WINDOW = 3;
-const REPETITION_HITS = 2;
+
+// Cap concurrent Claude calls. Beyond this, queue. Scribe NEVER stops.
+const MAX_CONCURRENT_TRANSLATIONS = 5;
 
 // Scribe sometimes still hallucinates English residue on silence. Same
-// patterns as before — applied to the committed Assamese transcript.
+// patterns as before — applied to the committed Assamese transcript before
+// we put it in the panel.
 const HALLUCINATION_PATTERNS: ReadonlyArray<RegExp> = [
   /^[\s.…]+$/,
   /^(thank you|thanks for watching|thanks for listening)/i,
@@ -30,19 +31,6 @@ function isHallucination(text: string): boolean {
   const t = text.trim();
   if (!t) return true;
   return HALLUCINATION_PATTERNS.some((p) => p.test(t));
-}
-
-function isRepetition(
-  text: string,
-  recent: ReadonlyArray<TranslationSegment>,
-): boolean {
-  const normalized = text.toLowerCase().trim();
-  if (!normalized) return false;
-  const window = recent.slice(-REPETITION_WINDOW);
-  const hits = window.filter(
-    (s) => s.englishText.toLowerCase().trim() === normalized,
-  ).length;
-  return hits >= REPETITION_HITS;
 }
 
 function makeSegmentId(): string {
@@ -74,25 +62,27 @@ export function useRealtimeTranscription(): UseRealtimeTranscriptionResult {
   const connectionRef = useRef<ScribeRealtimeConnection | null>(null);
   const isMountedRef = useRef(true);
 
-  // Claude resilience (carried over from the old useTranslation)
+  // Parallel-translation state — refs because they shouldn't trigger renders.
+  const activeTranslationsRef = useRef(0);
+  const translationQueueRef = useRef<Array<{ id: string; text: string }>>([]);
   const controllersRef = useRef<Set<AbortController>>(new Set());
+
+  // Resilience tracking carried over from the previous orchestrator.
   const consecutiveFailuresRef = useRef(0);
   const apiDurationsRef = useRef<number[]>([]);
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const slowTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const inflightClaudeCountRef = useRef(0);
 
-  const addSegment = useSessionStore((s) => s.addSegment);
-  const setStatus = useSessionStore((s) => s.setStatus);
-  const setError = useSessionStore((s) => s.setError);
-  const setIsProcessingChunk = useSessionStore((s) => s.setIsProcessingChunk);
-  const setSlowChunkProcessing = useSessionStore(
-    (s) => s.setSlowChunkProcessing,
+  const addAssameseSegment = useSessionStore((s) => s.addAssameseSegment);
+  const addEnglishTranslation = useSessionStore((s) => s.addEnglishTranslation);
+  const addPendingTranslation = useSessionStore((s) => s.addPendingTranslation);
+  const removePendingTranslation = useSessionStore(
+    (s) => s.removePendingTranslation,
   );
+  const setError = useSessionStore((s) => s.setError);
+  const setSlowConnection = useSessionStore((s) => s.setSlowConnection);
   const setWarningBannerVisible = useSessionStore(
     (s) => s.setWarningBannerVisible,
   );
-  const setSlowConnection = useSessionStore((s) => s.setSlowConnection);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -107,7 +97,8 @@ export function useRealtimeTranscription(): UseRealtimeTranscriptionResult {
       }
       controllersRef.current.clear();
       if (warningTimerRef.current) clearTimeout(warningTimerRef.current);
-      if (slowTimerRef.current) clearTimeout(slowTimerRef.current);
+      translationQueueRef.current = [];
+      activeTranslationsRef.current = 0;
       connectionRef.current?.disconnect();
       connectionRef.current = null;
     };
@@ -145,40 +136,94 @@ export function useRealtimeTranscription(): UseRealtimeTranscriptionResult {
     }
   }, [setWarningBannerVisible]);
 
-  const markClaudeBusy = useCallback(() => {
-    inflightClaudeCountRef.current += 1;
-    setIsProcessingChunk(true);
-    setStatus("translating");
-    if (slowTimerRef.current) clearTimeout(slowTimerRef.current);
-    slowTimerRef.current = setTimeout(() => {
-      setSlowChunkProcessing(true);
-    }, SLOW_CHUNK_DELAY_MS);
-  }, [setIsProcessingChunk, setSlowChunkProcessing, setStatus]);
+  // Fire a Claude call. Fire-and-forget — never blocks the WS message
+  // handler. Up to MAX_CONCURRENT_TRANSLATIONS may run in parallel; beyond
+  // that we queue and drain in the .finally() block.
+  const translateInBackground = useCallback(
+    (segmentId: string, assameseText: string) => {
+      const run = async () => {
+        if (!isMountedRef.current) return;
+        if (activeTranslationsRef.current >= MAX_CONCURRENT_TRANSLATIONS) {
+          translationQueueRef.current.push({ id: segmentId, text: assameseText });
+          return;
+        }
 
-  const markClaudeIdle = useCallback(() => {
-    inflightClaudeCountRef.current = Math.max(
-      0,
-      inflightClaudeCountRef.current - 1,
-    );
-    if (inflightClaudeCountRef.current === 0) {
-      if (slowTimerRef.current) {
-        clearTimeout(slowTimerRef.current);
-        slowTimerRef.current = null;
-      }
-      setSlowChunkProcessing(false);
-      setIsProcessingChunk(false);
-      const st = useSessionStore.getState();
-      if (st.status === "translating") {
-        st.setStatus(st.isListening ? "listening" : "idle");
-      }
-    }
-  }, [setIsProcessingChunk, setSlowChunkProcessing]);
+        activeTranslationsRef.current += 1;
+        addPendingTranslation(segmentId);
 
-  // Translate a committed Assamese segment with Claude, then write to store.
+        const controller = new AbortController();
+        controllersRef.current.add(controller);
+        const timer = setTimeout(() => controller.abort(), CLAUDE_TIMEOUT_MS);
+        const start = Date.now();
+
+        try {
+          const claudeOut = await translateWithClaude(
+            assameseText,
+            controller.signal,
+          );
+          const englishText = claudeOut.trim();
+          if (!isMountedRef.current) return;
+          if (englishText.length < 2) {
+            console.log(
+              `[LINGO] Claude returned empty for segment ${segmentId} — skipping`,
+            );
+            onPipelineFailure();
+            return;
+          }
+          console.log(`[LINGO] Claude translate → "${englishText}"`);
+          const translation: EnglishTranslation = {
+            id: segmentId,
+            text: englishText,
+            timestamp: new Date(),
+          };
+          addEnglishTranslation(translation);
+          onPipelineSuccess();
+        } catch (err) {
+          console.error(
+            `[LINGO] Claude failed for segment ${segmentId} (${describeError(err)})`,
+          );
+          if (isMountedRef.current) {
+            // Place a visible failure marker so the bottom panel doesn't
+            // silently lag behind the top panel forever.
+            addEnglishTranslation({
+              id: segmentId,
+              text: "[Translation failed]",
+              timestamp: new Date(),
+            });
+            onPipelineFailure();
+          }
+        } finally {
+          clearTimeout(timer);
+          controllersRef.current.delete(controller);
+          recordApiDuration(Date.now() - start);
+          removePendingTranslation(segmentId);
+          activeTranslationsRef.current = Math.max(
+            0,
+            activeTranslationsRef.current - 1,
+          );
+          // Drain one queued chunk if anything's waiting.
+          const next = translationQueueRef.current.shift();
+          if (next) translateInBackground(next.id, next.text);
+        }
+      };
+      void run();
+    },
+    [
+      addEnglishTranslation,
+      addPendingTranslation,
+      removePendingTranslation,
+      onPipelineFailure,
+      onPipelineSuccess,
+      recordApiDuration,
+    ],
+  );
+
+  // Scribe committed → push Assamese immediately, fire Claude in background.
+  // No await. The WS handler returns instantly so the next committed
+  // transcript can land while Claude is still working.
   const handleCommitted = useCallback(
-    async (assameseText: string) => {
+    (assameseText: string) => {
       if (!isMountedRef.current) return;
-
       if (isHallucination(assameseText)) {
         console.log(
           `[LINGO] Hallucination detected: "${assameseText}" — skipping`,
@@ -186,66 +231,16 @@ export function useRealtimeTranscription(): UseRealtimeTranscriptionResult {
         return;
       }
 
-      markClaudeBusy();
-
-      const controller = new AbortController();
-      controllersRef.current.add(controller);
-      const timer = setTimeout(() => controller.abort(), CLAUDE_TIMEOUT_MS);
-      const startMs = Date.now();
-
-      let englishText = "";
-      try {
-        const claudeOut = await translateWithClaude(
-          assameseText,
-          controller.signal,
-        );
-        englishText = claudeOut.trim();
-        console.log(`[LINGO] Claude translate → "${englishText}"`);
-      } catch (err) {
-        console.error(
-          `[LINGO] Claude translate failed (${describeError(err)})`,
-        );
-        onPipelineFailure();
-        return;
-      } finally {
-        clearTimeout(timer);
-        controllersRef.current.delete(controller);
-        recordApiDuration(Date.now() - startMs);
-        markClaudeIdle();
-      }
-
-      if (!englishText || englishText.length < 2) {
-        console.log("[LINGO] Claude returned empty — skipping");
-        return;
-      }
-
-      if (isRepetition(englishText, useSessionStore.getState().segments)) {
-        console.log(
-          `[LINGO] Repetition detected — "${englishText}" appeared in recent segments, skipping`,
-        );
-        return;
-      }
-
-      if (!isMountedRef.current) return;
-
-      const segment: TranslationSegment = {
-        id: makeSegmentId(),
-        englishText,
-        assameseText,
+      const id = makeSegmentId();
+      const segment: AssameseSegment = {
+        id,
+        text: assameseText,
         timestamp: new Date(),
-        source: "claude-fallback",
       };
-      addSegment(segment);
-      onPipelineSuccess();
+      addAssameseSegment(segment);
+      translateInBackground(id, assameseText);
     },
-    [
-      addSegment,
-      markClaudeBusy,
-      markClaudeIdle,
-      onPipelineFailure,
-      onPipelineSuccess,
-      recordApiDuration,
-    ],
+    [addAssameseSegment, translateInBackground],
   );
 
   const connect = useCallback(() => {
@@ -275,14 +270,11 @@ export function useRealtimeTranscription(): UseRealtimeTranscriptionResult {
       },
       onCommittedTranscript: (text) => {
         if (!isMountedRef.current) return;
-        // Clear the partial — the next utterance will rebuild it.
         setPartialTranscript("");
-        void handleCommitted(text);
+        handleCommitted(text);
       },
       onError: (errorType) => {
         if (!isMountedRef.current) return;
-        // Surface only the first hard error to the user — verbose error
-        // events from the server during a session would otherwise pile up.
         if (!useSessionStore.getState().error) {
           setError(`Transcription error: ${errorType}`);
         }
@@ -291,14 +283,10 @@ export function useRealtimeTranscription(): UseRealtimeTranscriptionResult {
         if (!isMountedRef.current) return;
         setIsConnected(false);
         setPartialTranscript("");
-        // Drop the ref so the next connect() can mint a fresh connection
-        // (the existing instance is now in a terminal state).
         connectionRef.current = null;
       },
     });
     connectionRef.current = conn;
-    // Token fetch + WebSocket setup is async; fire-and-forget. Errors are
-    // routed through onError → store.setError.
     void conn.connect();
   }, [handleCommitted, setError]);
 

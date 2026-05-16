@@ -1,11 +1,14 @@
-export type TranslationSource = "whisper-direct" | "claude-fallback";
-
-export interface TranslationSegment {
+export interface AssameseSegment {
   id: string;
-  englishText: string;
-  assameseText?: string;
+  text: string;
   timestamp: Date;
-  source: TranslationSource;
+}
+
+export interface EnglishTranslation {
+  /** Matches the AssameseSegment that produced it. */
+  id: string;
+  text: string;
+  timestamp: Date;
 }
 
 export type AppStatus = "idle" | "listening" | "translating" | "error";

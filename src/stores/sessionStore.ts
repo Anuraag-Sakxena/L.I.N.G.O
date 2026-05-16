@@ -2,7 +2,11 @@
 
 import { create } from "zustand";
 
-import type { AppStatus, TranslationSegment } from "@/types";
+import type {
+  AppStatus,
+  AssameseSegment,
+  EnglishTranslation,
+} from "@/types";
 
 const MAX_SEGMENTS = 200;
 
@@ -14,7 +18,7 @@ function logMemoryIfMilestone(count: number) {
     .memory;
   if (mem?.usedJSHeapSize) {
     const mb = Math.round(mem.usedJSHeapSize / 1024 / 1024);
-    console.log(`[LINGO] Memory: ${mb}MB at ${count} segments`);
+    console.log(`[LINGO] Memory: ${mb}MB at ${count} Assamese segments`);
   }
 }
 
@@ -22,52 +26,51 @@ export interface LingoStore {
   isListening: boolean;
   sessionStartTime: number | null;
 
-  segments: TranslationSegment[];
+  // Dual-list translation model:
+  // - assameseSegments: ordered append-only (lands when Scribe commits).
+  // - englishTranslations: keyed by Assamese id (lands when Claude returns,
+  //   possibly out of order).
+  // - pendingTranslationIds: ids currently in-flight at Claude. Drives the
+  //   "Translating…" indicator.
+  assameseSegments: AssameseSegment[];
+  englishTranslations: Record<string, EnglishTranslation>;
+  pendingTranslationIds: Set<string>;
 
   status: AppStatus;
   error: string | null;
 
-  // Translation pipeline state
-  isProcessingChunk: boolean;
-  slowChunkProcessing: boolean;
-  chunkQueue: Blob[];
-
-  // Resilience state
-  warningBannerVisible: boolean;
   isOnline: boolean;
   slowConnection: boolean;
+  warningBannerVisible: boolean;
 
   startListening: () => Promise<void>;
   stopListening: () => void;
-  addSegment: (segment: TranslationSegment) => void;
+  addAssameseSegment: (seg: AssameseSegment) => void;
+  addEnglishTranslation: (trans: EnglishTranslation) => void;
+  addPendingTranslation: (id: string) => void;
+  removePendingTranslation: (id: string) => void;
   clearSession: () => void;
   setStatus: (s: AppStatus) => void;
   setError: (message: string | null) => void;
-  setIsProcessingChunk: (v: boolean) => void;
-  setSlowChunkProcessing: (v: boolean) => void;
-  enqueueChunk: (blob: Blob) => void;
-  drainChunkQueue: () => Blob[];
-  setWarningBannerVisible: (v: boolean) => void;
   setOnline: (v: boolean) => void;
   setSlowConnection: (v: boolean) => void;
+  setWarningBannerVisible: (v: boolean) => void;
 }
 
-export const useSessionStore = create<LingoStore>((set, get) => ({
+export const useSessionStore = create<LingoStore>((set) => ({
   isListening: false,
   sessionStartTime: null,
 
-  segments: [],
+  assameseSegments: [],
+  englishTranslations: {},
+  pendingTranslationIds: new Set<string>(),
 
   status: "idle",
   error: null,
 
-  isProcessingChunk: false,
-  slowChunkProcessing: false,
-  chunkQueue: [],
-
-  warningBannerVisible: false,
   isOnline: true,
   slowConnection: false,
+  warningBannerVisible: false,
 
   startListening: async () => {
     set({
@@ -85,33 +88,62 @@ export const useSessionStore = create<LingoStore>((set, get) => ({
     });
   },
 
-  addSegment: (segment) =>
+  addAssameseSegment: (segment) =>
     set((state) => {
-      const next = [...state.segments, segment];
+      const next = [...state.assameseSegments, segment];
       let segments = next;
       if (next.length > MAX_SEGMENTS) {
         const trim = next.length - MAX_SEGMENTS;
         console.log(
-          `[LINGO] Segment cap reached — removing ${trim} oldest segment(s)`,
+          `[LINGO] Assamese cap reached — removing ${trim} oldest segment(s)`,
         );
         segments = next.slice(trim);
+        // GC the corresponding English entries.
+        const dropped = next.slice(0, trim);
+        const englishTranslations = { ...state.englishTranslations };
+        for (const s of dropped) delete englishTranslations[s.id];
+        logMemoryIfMilestone(segments.length);
+        return { assameseSegments: segments, englishTranslations };
       }
       logMemoryIfMilestone(segments.length);
-      return { segments };
+      return { assameseSegments: segments };
+    }),
+
+  addEnglishTranslation: (translation) =>
+    set((state) => ({
+      englishTranslations: {
+        ...state.englishTranslations,
+        [translation.id]: translation,
+      },
+    })),
+
+  addPendingTranslation: (id) =>
+    set((state) => {
+      if (state.pendingTranslationIds.has(id)) return {};
+      const next = new Set(state.pendingTranslationIds);
+      next.add(id);
+      return { pendingTranslationIds: next };
+    }),
+
+  removePendingTranslation: (id) =>
+    set((state) => {
+      if (!state.pendingTranslationIds.has(id)) return {};
+      const next = new Set(state.pendingTranslationIds);
+      next.delete(id);
+      return { pendingTranslationIds: next };
     }),
 
   clearSession: () =>
     set({
       isListening: false,
       sessionStartTime: null,
-      segments: [],
+      assameseSegments: [],
+      englishTranslations: {},
+      pendingTranslationIds: new Set<string>(),
       status: "idle",
       error: null,
-      isProcessingChunk: false,
-      slowChunkProcessing: false,
-      chunkQueue: [],
-      warningBannerVisible: false,
       slowConnection: false,
+      warningBannerVisible: false,
     }),
 
   setStatus: (s) => set({ status: s }),
@@ -122,22 +154,9 @@ export const useSessionStore = create<LingoStore>((set, get) => ({
       status: message ? "error" : "idle",
     }),
 
-  setIsProcessingChunk: (v) => set({ isProcessingChunk: v }),
-  setSlowChunkProcessing: (v) => set({ slowChunkProcessing: v }),
-
-  enqueueChunk: (blob) =>
-    set((state) => ({ chunkQueue: [...state.chunkQueue, blob] })),
-
-  drainChunkQueue: () => {
-    const queue = get().chunkQueue;
-    if (queue.length === 0) return [];
-    set({ chunkQueue: [] });
-    return queue;
-  },
-
-  setWarningBannerVisible: (v) => set({ warningBannerVisible: v }),
   setOnline: (v) => set({ isOnline: v }),
   setSlowConnection: (v) => set({ slowConnection: v }),
+  setWarningBannerVisible: (v) => set({ warningBannerVisible: v }),
 }));
 
 export default useSessionStore;
