@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import {
+  AdditiveBlending,
   BackSide,
   Color,
   Group,
@@ -89,26 +90,34 @@ uniform float uTime;
 uniform float uVolume;
 uniform float uPulse;
 
-varying vec3 vNormal;
 varying vec3 vPosition;
 varying float vDisplacement;
+varying float vFresnel;
 
 void main() {
-  vNormal = normalize(normal);
   vPosition = position;
 
-  // Slow, ambient breathing — visible even at silence.
-  float baseNoise = snoise(position * 1.5 + uTime * 0.15) * 0.08;
-  // Audio-reactive disturbance — faster + stronger with volume.
-  float audioNoise = snoise(position * 3.0 + uTime * 0.5) * uVolume * 0.35;
-  // Short-lived pulse displacement when a translation lands.
-  float pulseNoise = snoise(position * 4.0 + uTime * 1.2) * uPulse * 0.25;
+  // Almost-perfect sphere at idle — gentle breathing only.
+  float baseNoise = snoise(position * 2.0 + uTime * 0.1) * 0.025;
+  // Audio-reactive disturbance — visible during speech, never extreme.
+  float audioNoise = snoise(position * 3.5 + uTime * 0.4) * uVolume * 0.15;
+  // Brief pulse when a translation lands.
+  float pulseNoise = snoise(position * 5.0 + uTime * 1.0) * uPulse * 0.12;
 
   float displacement = baseNoise + audioNoise + pulseNoise;
   vDisplacement = displacement;
 
-  vec3 newPosition = position + normal * displacement;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(newPosition, 1.0);
+  vec3 displacedPos = position + normal * displacement;
+  vec4 mvPosition = modelViewMatrix * vec4(displacedPos, 1.0);
+
+  // Fresnel computed in vertex shader (view-space normal vs view dir) —
+  // smoother and avoids the cameraPosition / local-vs-world confusion the
+  // previous fragment-shader version had.
+  vec3 viewSpaceNormal = normalize(normalMatrix * normal);
+  vec3 viewDir = normalize(-mvPosition.xyz);
+  vFresnel = pow(1.0 - max(dot(viewSpaceNormal, viewDir), 0.0), 3.0);
+
+  gl_Position = projectionMatrix * mvPosition;
 }
 `;
 
@@ -117,37 +126,49 @@ ${GLSL_SIMPLEX_3D}
 
 uniform float uTime;
 uniform float uVolume;
-uniform vec3 uBaseColor;
-uniform vec3 uAccentColor;
+uniform vec3 uBaseColor;    // deep blue
+uniform vec3 uAccentColor;  // bright cyan
+uniform vec3 uRimColor;     // near-white
 
-varying vec3 vNormal;
 varying vec3 vPosition;
 varying float vDisplacement;
+varying float vFresnel;
 
 void main() {
-  vec3 viewDirection = normalize(cameraPosition - vPosition);
-  float fresnel = pow(1.0 - clamp(dot(viewDirection, vNormal), 0.0, 1.0), 2.5);
+  float fresnel = clamp(vFresnel, 0.0, 1.0);
 
-  vec3 color = mix(uBaseColor, uAccentColor, fresnel * 0.7 + vDisplacement * 2.0);
+  // Layer 1 — dark blue core (you're looking INTO the sphere).
+  vec3 coreColor = uBaseColor * 0.4;
 
-  // Dramatic dark-core to bright-edge ramp (Dribbble-reference look):
-  // centre stays ~35% brightness, silhouette gets the full brightness curve.
-  float brightness = 0.6 + uVolume * 0.4;
-  color *= brightness * (0.35 + fresnel * 0.65);
+  // Layer 2 — slow internal plasma drift between base and accent.
+  float internalNoise = snoise(vPosition * 4.0 + uTime * 0.08) * 0.5 + 0.5;
+  vec3 midColor = mix(uBaseColor, uAccentColor, internalNoise * 0.4);
 
-  // White-cyan rim light along the silhouette.
-  color += vec3(0.7, 0.9, 1.0) * fresnel * 0.3;
+  // Layer 3 — bright fresnel rim (the energy-sphere signature).
+  vec3 rimGlow = uRimColor * fresnel * fresnel;
 
-  // Sharp, faint blue-white veins — peaked noise so values cluster near zero
-  // and only the highest noise ridges produce visible streaks.
-  float veinNoise = pow(abs(snoise(vPosition * 8.0 + uTime * 0.1)), 3.0);
-  color += vec3(0.3, 0.5, 0.8) * veinNoise * 0.15 * (0.5 + fresnel);
+  // Volume-reactive overall brightness.
+  float brightness = 0.5 + uVolume * 0.5;
 
-  // Inner glow brighter toward the centre.
-  float innerGlow = 1.0 - fresnel;
-  color += uBaseColor * innerGlow * 0.15;
+  // Compose: dark core blends into mid-tone, then rim glow on top.
+  vec3 color = mix(coreColor, midColor, 0.3 + fresnel * 0.5);
+  color += rimGlow * (0.6 + uVolume * 0.4);
 
-  gl_FragColor = vec4(color, 0.95);
+  // Subsurface-scatter feel — light bleeding through the silhouette.
+  color += uAccentColor * fresnel * 0.15;
+
+  color *= brightness;
+
+  // Almost-invisible vein highlights, mostly near the rim.
+  float veins = pow(abs(snoise(vPosition * 6.0 + uTime * 0.05)), 4.0);
+  color += uRimColor * veins * 0.06 * fresnel;
+
+  // Hot bloom at the very edge — thin white halo line at the silhouette.
+  color += vec3(1.0) * pow(fresnel, 5.0) * 0.2;
+
+  // Slight transparency lets additive blending bloom against the void.
+  float alpha = 0.92 + fresnel * 0.08;
+  gl_FragColor = vec4(color, alpha);
 }
 `;
 
@@ -164,8 +185,11 @@ uniform vec3 uColor;
 uniform float uVolume;
 varying vec3 vNormal;
 void main() {
-  float intensity = pow(0.65 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 2.0);
-  float alpha = intensity * (0.15 + uVolume * 0.25);
+  // pow 3.0 (was 2.0) concentrates the falloff right at the orb's edge —
+  // the halo hugs the silhouette instead of fanning out as a fuzzy disc.
+  float intensity = pow(0.55 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 3.0);
+  intensity = max(0.0, intensity);
+  float alpha = intensity * (0.08 + uVolume * 0.15);
   gl_FragColor = vec4(uColor, alpha);
 }
 `;
@@ -241,32 +265,44 @@ export function useOrb({
     //               with generous dark space).
     camera.position.set(0, 0, 9.5);
 
-    // Geometry detail: 64 vertices per icosahedron face on full motion mode,
-    // 24 under prefers-reduced-motion (still smooth, ~5.8k vertices).
-    const detail = reducedMotion ? 24 : 64;
+    // Geometry detail: 48 (≈23k vertices) on full motion mode, 24 under
+    // prefers-reduced-motion. Lowered from 64 — at the new gentler
+    // displacement the visual difference is imperceptible and we save
+    // ~30% of the per-frame vertex shader work.
+    const detail = reducedMotion ? 24 : 48;
     const orbGeometry = new IcosahedronGeometry(1, detail);
     const orbMaterial = new ShaderMaterial({
       transparent: true,
+      // Additive blending makes the bright rim/edge bloom against the dark
+      // space background — the secret sauce for the energy-sphere look.
+      blending: AdditiveBlending,
+      depthWrite: false,
       vertexShader: ORB_VERTEX_SHADER,
       fragmentShader: ORB_FRAGMENT_SHADER,
       uniforms: {
         uTime: { value: 0 },
         uVolume: { value: 0 },
         uPulse: { value: 0 },
-        uBaseColor: { value: new Color(0x00d4aa) },
-        uAccentColor: { value: new Color(0x6366f1) },
+        // Deep blue core, bright cyan rim, near-white halo — ditches the
+        // old teal/indigo green-cast for the Dribbble-reference blue.
+        uBaseColor: { value: new Color(0.15, 0.35, 0.95) },
+        uAccentColor: { value: new Color(0.3, 0.7, 1.0) },
+        uRimColor: { value: new Color(0.7, 0.9, 1.0) },
       },
     });
     const orbMesh = new Mesh(orbGeometry, orbMaterial);
 
-    const glowGeometry = new SphereGeometry(1.4, 32, 32);
+    // Tighter halo (1.4 → 1.2) so it hugs the orb instead of becoming a
+    // disc, and bluer to match the new palette.
+    const glowGeometry = new SphereGeometry(1.2, 32, 32);
     const glowMaterial = new ShaderMaterial({
       transparent: true,
       side: BackSide,
+      depthWrite: false,
       vertexShader: GLOW_VERTEX_SHADER,
       fragmentShader: GLOW_FRAGMENT_SHADER,
       uniforms: {
-        uColor: { value: new Color(0x00d4aa) },
+        uColor: { value: new Color(0.2, 0.5, 1.0) },
         uVolume: { value: 0 },
       },
     });
