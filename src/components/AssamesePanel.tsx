@@ -118,7 +118,7 @@ export function AssamesePanel({ partialTranscript }: AssamesePanelProps) {
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
-        className="flex-1 overflow-y-auto px-4 pb-3"
+        className="hide-scrollbar flex-1 overflow-y-auto px-4 pb-3"
         style={{ WebkitOverflowScrolling: "touch" }}
       >
         {segments.length === 0 && !partialTranscript ? (

@@ -327,11 +327,18 @@ export default function Page() {
             transition={{ duration: 0.3 }}
             className="fixed inset-0 z-20 flex flex-col gap-0 px-4"
             style={{
-              paddingTop: "max(env(safe-area-inset-top), 16px)",
+              // +12px below the safe-area-top so the Assamese panel sits
+              // clear of the iPhone Dynamic Island.
+              paddingTop: "calc(max(env(safe-area-inset-top), 16px) + 12px)",
               paddingBottom: "max(env(safe-area-inset-bottom), 16px)",
             }}
           >
-            <AssamesePanel partialTranscript={partialTranscript} />
+            {/* Assamese panel — 0.7× the English panel's height. The
+                wrapper claims that flex share; the panel's own flex-1
+                fills the wrapper. */}
+            <div className="flex flex-[0.7] min-h-0 flex-col">
+              <AssamesePanel partialTranscript={partialTranscript} />
+            </div>
 
             {/* The 24px sliver where the sharp orb shows through. */}
             <div
@@ -340,13 +347,14 @@ export default function Page() {
               aria-hidden
             />
 
-            <EnglishPanel />
+            <div className="flex flex-1 min-h-0 flex-col">
+              <EnglishPanel />
+            </div>
 
             {/* Footer: timer + segment count + stop / clear */}
             <div className="flex shrink-0 flex-col items-center gap-2 pt-3">
               <span className="font-mono text-[11px] tabular-nums text-white/40">
-                {formatTime(elapsedMs)} · {englishCount}{" "}
-                {englishCount === 1 ? "segment" : "segments"}
+                {formatTime(elapsedMs)}
               </span>
 
               <AnimatePresence mode="wait" initial={false}>

@@ -120,7 +120,7 @@ export function EnglishPanel() {
         onScroll={handleScroll}
         role="log"
         aria-live="polite"
-        className="flex-1 overflow-y-auto px-4 pb-3"
+        className="hide-scrollbar flex-1 overflow-y-auto px-4 pb-3"
         style={{ WebkitOverflowScrolling: "touch" }}
       >
         {orderedTranslations.length === 0 && pendingCount === 0 ? (

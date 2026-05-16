@@ -97,6 +97,16 @@ body {
   color: var(--text-primary);
 }
 
+/* Invisible scrollbar — keeps scroll behaviour, hides the chrome.
+   Used on the dual translation panels. */
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 /* --- Space background + starfield --- */
 
 .space-bg {
