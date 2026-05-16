@@ -158,8 +158,7 @@ export class ScribeRealtimeConnection {
           }
           return;
 
-        case "committed_transcript":
-        case "committed_transcript_with_timestamps": {
+        case "committed_transcript": {
           const text = (msg.text ?? "").trim();
           const lang = msg.language_code;
           if (text) {
@@ -170,6 +169,13 @@ export class ScribeRealtimeConnection {
           }
           return;
         }
+
+        case "committed_transcript_with_timestamps":
+          // INTENTIONALLY IGNORED. ElevenLabs emits this alongside the
+          // plain `committed_transcript` for every utterance, even when
+          // include_timestamps=false. Processing both produces duplicate
+          // segments in both panels.
+          return;
 
         default:
           if (type.toLowerCase().includes("error")) {
