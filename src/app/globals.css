@@ -1,26 +1,143 @@
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600;700&family=Noto+Sans+Bengali:wght@400;500;600&display=swap");
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg-deep: #0a0f1c;
+  --bg-surface: #111827;
+  --accent-teal: #00d4aa;
+  --accent-indigo: #6366f1;
+  --accent-amber: #f59e0b;
+  --accent-red: #ef4444;
+  --text-primary: #f1f5f9;
+  --text-muted: #94a3b8;
+  --glass-bg: rgba(255, 255, 255, 0.06);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-blur: 20px;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-bg-deep: var(--bg-deep);
+  --color-bg-surface: var(--bg-surface);
+  --color-accent-teal: var(--accent-teal);
+  --color-accent-indigo: var(--accent-indigo);
+  --color-accent-amber: var(--accent-amber);
+  --color-accent-red: var(--accent-red);
+  --color-text-primary: var(--text-primary);
+  --color-text-muted: var(--text-muted);
+
+  --font-sans: "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --font-assamese: "Noto Sans Assamese", "Noto Sans Bengali", sans-serif;
+
+  --background-image-gradient-teal-indigo: linear-gradient(
+    135deg,
+    var(--accent-teal) 0%,
+    var(--accent-indigo) 100%
+  );
+  --background-image-gradient-indigo-teal: linear-gradient(
+    135deg,
+    var(--accent-indigo) 0%,
+    var(--accent-teal) 100%
+  );
+  --background-image-gradient-deep: linear-gradient(
+    180deg,
+    var(--bg-deep) 0%,
+    var(--bg-surface) 100%
+  );
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  height: 100%;
+  overscroll-behavior: none;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  min-height: 100dvh;
+  overflow: hidden;
+}
+
+/* Suppress the grey tap-flash on iOS Safari without disabling focus rings. */
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+
+::selection {
+  background: rgba(0, 212, 170, 0.35);
+  color: var(--text-primary);
+}
+
+/* --- Space background + starfield --- */
+
+.space-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+  background: radial-gradient(
+    ellipse at 50% 50%,
+    #0d1224 0%,
+    #070b14 50%,
+    #030508 100%
+  );
+}
+
+.star {
+  position: absolute;
+  background-color: #ffffff;
+  border-radius: 9999px;
+  opacity: var(--star-opacity, 0.3);
+}
+
+.star-twinkle {
+  animation-name: lingo-twinkle;
+  animation-iteration-count: infinite;
+  animation-timing-function: ease-in-out;
+}
+
+@keyframes lingo-twinkle {
+  0%,
+  100% {
+    opacity: var(--star-opacity, 0.3);
+  }
+  50% {
+    opacity: 0.05;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .star-twinkle {
+    animation: none;
+  }
 }
